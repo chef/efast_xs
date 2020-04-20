@@ -69,6 +69,19 @@ static inline size_t bytes_for(int n)
 	/* if (n < 10000000), we won't have cases above 0x10FFFF */
 	return sizeof("&#9999999;") - 1;
 }
+static inline size_t utf8_char_length(int input) {
+    size_t len = 0;
+    switch (input & 240) {  // 11110000
+      case 192: len = 2; break; // 110xxxxx
+      case 224: len = 3; break; // 1110xxxx
+      case 240: len = 4; break; // 11110xxx
+      default: len = 1;
+    }
+//    erts_printf("%d utf8_char_length: %d\n", input, len);
+    return len;
+}
+// efast_xs:escape(<<"⨕„⨡">>).
+
 
 static size_t do_escape(unsigned char *buf, int n)
 {
@@ -97,25 +110,36 @@ static size_t do_escape(unsigned char *buf, int n)
 	}
 
 #undef return_const_len
+  size_t utf8len = utf8_char_length(n);
+  if (unlikely(utf8len > 1)) {
+    // we will not do any replacement - let the controlling
+    // loop handle that since we can't update its position in the
+    // source string.
+    // This runs into problems if our replacement
+    // strings exceed 15 bytes, but in no cases do they...
+    return utf8len << 4;
+  } else {
 
-	CP_1252_ESCAPE(n);
 
-	if (VALID_VALUE(n)) {
-		/* return snprintf(buf, sizeof("&#1114111;"), "&#%i;", n); */
-		static const char digitmap[] = "0123456789";
-		size_t rv = sizeof("&#;") - 1;
-		buf += bytes_for(n);
-		*--buf = ';';
-		do {
-			*--buf = digitmap[(int)(n % 10)];
-			++rv;
-		} while (n /= 10);
-		*--buf = '#';
-		*--buf = '&';
-		return rv;
-	}
-	buf[0] = '*';
-	return 1;
+    CP_1252_ESCAPE(n);
+
+    if (VALID_VALUE(n)) {
+      /* return snprintf(buf, sizeof("&#1114111;"), "&#%i;", n); */
+      static const char digitmap[] = "0123456789";
+      size_t rv = sizeof("&#;") - 1;
+      buf += bytes_for(n);
+      *--buf = ';';
+      do {
+        *--buf = digitmap[(int)(n % 10)];
+        ++rv;
+      } while (n /= 10);
+      *--buf = '#';
+      *--buf = '&';
+      return rv;
+    }
+    buf[0] = '*';
+    return 1;
+  }
 }
 
 /*
@@ -131,31 +155,62 @@ unsigned char * efast_xs(unsigned char * string, size_t len, size_t * result_siz
 	size_t s_len = len;
 	unsigned char *tmp;
 	unsigned char * rv;
-        unsigned char * c;
+  unsigned char * c;
+  size_t utf8len = 0;
+  size_t x;
 
-	for (i = len-1; i>=0; --i) {
+  for (i = 0; i<len; i++) {
 		int n = string[i];
-		if (likely(n < 128)) {
-			if (unlikely(n == '"'))
-				s_len += (sizeof("&quot;") - 2);
-			if (unlikely(n == '&'))
-				s_len += (sizeof("&amp;") - 2);
-			if (unlikely(n == '>' || n == '<'))
-				s_len += (sizeof("&gt;") - 2);
-			continue;
-		}
+    // erts_printf("Checking position %d\n",  i);
+    utf8len = utf8_char_length(string[i]);
+    if (unlikely((utf8len > 1))) {
+      // Note no modification to s_len, that length aclready accurately accounts for
+      // all characters.
+      i += (utf8len - 1);
+//      erts_printf("Position is now %d, length is %d, total calc len %d\n",  i, len, s_len);
+      continue;
+    }
 
-		CP_1252_ESCAPE(n);
+    if (likely(n < 128)) {
+      if (unlikely(n == '"'))
+        s_len += (sizeof("&quot;") - 2);
+      if (unlikely(n == '&'))
+        s_len += (sizeof("&amp;") - 2);
+      if (unlikely(n == '>' || n == '<'))
+        s_len += (sizeof("&gt;") - 2);
+      continue;
+    }
+    // Note: we're not escaping things in the unicode range, even
+    // though the table in CP_1252_ESCAPE supports it - because these are
+    // UTF-8 characters and we'r eusing UTF-8 encoding, there should be no need
+    // to treat them any differently.
+    CP_1252_ESCAPE(n);
 
-		if (VALID_VALUE(n))
-			s_len += bytes_for(n) - 1;
+    if (VALID_VALUE(n))
+      s_len += bytes_for(n) - 1;
+
 	}
+//  erts_printf("Parse compkete, allocating: %d\n", s_len);
 	rv = enif_alloc(s_len);
-        *result_size = s_len;
-        c = rv;
+  *result_size = s_len;
+  c = rv;
 	for (tmp = string, i = len-1;i >= 0; --i,tmp++){
-	    c += do_escape(c, *tmp);
-        }
+    utf8len = do_escape(c, *tmp);
+    if (likely(utf8len < 15)) {
+      c += utf8len; // just basic length of replacement char or string.
+    } else {
+      // utf8 len of the character
+      utf8len = utf8len >> 4;
+      while (utf8len-- > 0) {
+        *c = *tmp;
+        c++;
+        i--;
+        tmp++;
+
+      }
+    }
+  }
+
 	return rv;
 }
 
